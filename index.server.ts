@@ -51,7 +51,7 @@ export default function contribute(server: PluginServerContext) {
 
   server.on("agent.turn_ended", async (event, { paseo }) => {
     try {
-      await handleTurnEnded(event.agent.id, event.outcome, event.timeline, paseo);
+      await handleTurnEnded(event.agent.id, event.turnId, event.outcome, paseo);
     } catch (error) {
       console.error(`${LOG_PREFIX} turn_ended handler failed: ${String(error)}`);
     }

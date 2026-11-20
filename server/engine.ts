@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { PluginHandlerContext, PluginLifecycleEvents, PluginTurnOutcome } from "@getpaseo/plugin/server";
+import type { PluginHandlerContext, PluginTurnOutcome } from "@getpaseo/plugin/server";
 import {
   DEFAULT_MAX_NUDGES,
   GOAL_ITEM_KIND,
@@ -14,9 +14,12 @@ import { getGoal, listGoals, putGoal, removeGoal } from "./state";
 
 const LOG_PREFIX = "[goal-mode]";
 const OBJECTIVE_LIMIT = 4000;
+/** Entries fetched from the tail of the timeline to recover one turn's output. */
+const TAIL_ENTRIES = 24;
+/** How many trailing non-empty lines of that output can carry a marker. */
+const SCANNED_TAIL_LINES = 6;
 
 type Paseo = PluginHandlerContext["paseo"];
-type Timeline = PluginLifecycleEvents["agent.turn_ended"]["timeline"];
 
 export async function appendGoalItem(paseo: Paseo, agentId: string, data: GoalItemData): Promise<void> {
   try {
@@ -206,6 +209,32 @@ export async function listAllGoals(): Promise<Goal[]> {
 
 export type GoalMarker = { kind: "complete" } | { kind: "blocked"; reason: string } | null;
 
+/**
+ * `agent.turn.after` no longer carries the turn's timeline: the field is deprecated and always
+ * empty on current hosts. Read the turn's output back through the timeline RPC and keep only the
+ * entries stamped with this turn, so a marker cannot leak across turns.
+ */
+async function readTurnOutput(paseo: Paseo, agentId: string, turnId: string | null): Promise<string> {
+  try {
+    const page = await paseo.agents.ref(agentId).timeline.refetch({
+      direction: "tail",
+      limit: TAIL_ENTRIES,
+    });
+    const entries = page.entries ?? [];
+    if (entries.length === 0) {
+      return "";
+    }
+    const items = entries.map((entry) => entry.item);
+    const turnItems = turnId
+      ? items.filter((item) => ("turnId" in item ? item.turnId : undefined) === turnId)
+      : [];
+    return latestOutputText(turnItems.length > 0 ? turnItems : items);
+  } catch (error) {
+    console.error(`${LOG_PREFIX} timeline refetch failed agent=${agentId}: ${String(error)}`);
+    return "";
+  }
+}
+
 function normalizeLine(line: string): string {
   return line.replace(/^>\s*/, "").replace(/[*_`~]/g, "").replace(/\s+/g, " ").trim();
 }
@@ -215,7 +244,7 @@ export function scanGoalMarkers(output: string): GoalMarker {
     .split("\n")
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
-    .slice(-3);
+    .slice(-SCANNED_TAIL_LINES);
   for (const line of lines.reverse()) {
     const normalized = normalizeLine(line);
     const blocked = /<goal-blocked>([\s\S]*?)<\/goal-blocked>\s*$/i.exec(normalized);
@@ -232,8 +261,8 @@ export function scanGoalMarkers(output: string): GoalMarker {
 
 export async function handleTurnEnded(
   agentId: string,
+  turnId: string | null,
   outcome: PluginTurnOutcome,
-  timeline: Timeline,
   paseo: Paseo,
 ): Promise<void> {
   const goal = await getGoal(agentId);
@@ -293,7 +322,11 @@ export async function handleTurnEnded(
   }
 
   const reset: Goal = { ...goal, consecutiveFailures: 0, updatedAt: now };
-  const marker = scanGoalMarkers(latestOutputText(timeline));
+  const turnOutput = await readTurnOutput(paseo, agentId, turnId);
+  const marker = scanGoalMarkers(turnOutput);
+  if (marker === null) {
+    console.log(`${LOG_PREFIX} no marker in turn output agent=${agentId} chars=${turnOutput.length}`);
+  }
 
   if (marker?.kind === "complete") {
     const completed: Goal = { ...reset, status: "completed", completedAt: now };
